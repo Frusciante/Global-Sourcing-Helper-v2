@@ -14,7 +14,7 @@ from urllib.parse import urljoin
 from logic.browser_manager import BrowserManager
 from logic.excel_handler import ExcelHandler
 from ui_components.manual_panel import ManualControlPanel 
-from logic.utils import fetch_naver_exchange_rate
+from logic.utils import *
 
 class SourcingProcessor:
     def __init__(self, config, log_callback, app_root=None):
@@ -33,23 +33,14 @@ class SourcingProcessor:
         self.excel_handler = ExcelHandler(excel_file, self.log_callback, self.config)
         self.panel = None 
 
-        '''
-        # 2. AI (Gemini) 설정 (기존 코드 복원)
-        raw_keys = self.config.get('GEMINI_API_KEY', '')
-        self.api_keys = [k.strip() for k in raw_keys.split(',') if k.strip()]
-        self.current_key_idx = 0
-        self.model_candidates = ["gemini-2.5-flash", "gemini-2.5-flash-lite"] # 모델 우선순위
-        self.current_model_idx = 0
-        self.client = None
-        '''
         raw_keys = self.config.get('AI_API_KEY', '') # 설정 파일 키 이름 변경 권장
         self.api_keys = [k.strip() for k in raw_keys.split(',') if k.strip()]
         self.current_key_idx = 0
         self.model_candidates = [
-            "llama-3.3-70b", 
-            "qwen-3-32b", 
+            "gpt-oss-120b",
             "llama3.1-8b", 
-            "gpt-oss-120b"
+            "qwen-3-235b-a22b-instruct-2507",
+            "zai-glm-4.7"
         ]
         self.current_model_idx = 0
         self.client = None
@@ -106,19 +97,72 @@ class SourcingProcessor:
         except Exception as e:
             self.log_callback(f"⚠️ [Cache] 저장 실패: {e}")
 
+    def check_trademark(self, brand):
+        """
+        KIPRIS 상표권 API를 통해 브랜드의 국내 등록 여부를 확인합니다.
+        - True: 상표권 없음 (안전)
+        - False: 상표권 발견 (위험)
+        """
+        if not brand or brand.upper() in ["NULL", "OEM", "NONE", "", "N/A"]:
+            return True
+        
+        brand = brand.strip().upper()
+        
+        # 1. 캐시 확인 (불필요한 API 호출 방지)
+        if brand in self.brand_cache:
+            return self.brand_cache[brand]
+        
+        # KIPRIS 키가 없는 경우 기본적으로 안전하다고 가정하고 통과
+        if not self.kipris_keys:
+            return True
+    
+        api_url = "https://plus.kipris.or.kr/kipo-api/kipi/trademarkInfoSearchService/getWordSearch"
+        
+        # 2. 보유한 API 키 개수만큼 재시도 (키 소진 시 다음 키로 교체)
+        for _ in range(len(self.kipris_keys)):
+            current_key = self.kipris_keys[self.current_kipris_idx]
+            try:
+                params = {
+                    'searchString': brand,
+                    'ServiceKey': current_key
+                }
+                res = requests.get(api_url, params=params, timeout=15)
+                
+                if res.status_code != 200:
+                    raise Exception(f"HTTP Error {res.status_code}")
+                
+                # XML 파싱
+                root = ET.fromstring(res.content)
+                count_tag = root.find(".//totalCount")
+                
+                if count_tag is None:
+                    raise Exception("XML Parse Error (totalCount not found)")
+                
+                count = int(count_tag.text)
+                is_safe = (count == 0) # 검색 결과가 0건이어야 안전
+                
+                if not is_safe:
+                    self.log_callback(f"   🚫 [KIPRIS] 상표권 발견: '{brand}' ({count}건)")
+                
+                # 결과 캐싱 및 저장
+                self.brand_cache[brand] = is_safe
+                self._save_cache() # 캐시 파일 저장 (선택 사항)
+                
+                return is_safe
+    
+            except Exception as e:
+                # 현재 키 실패 시 인덱스 변경 후 다음 키 시도
+                self.log_callback(f"   ⚠️ KIPRIS API 키 오류 (Index {self.current_kipris_idx}): {e}")
+                self.current_kipris_idx = (self.current_kipris_idx + 1) % len(self.kipris_keys)
+                continue
+        
+        # 모든 키가 실패할 경우 안전하다고 가정하고 통과시키거나 에러 로그 남김
+        self.log_callback(f"   ❌ KIPRIS 모든 API 키 호출 실패: '{brand}'")
+        return True
+
     # ============================================================
     # [Core] AI & API 헬퍼 메서드 (기존 로직 유지)
     # ============================================================
-    '''
-    def _configure_genai(self):
-        if not self.api_keys: return
-        current_key = self.api_keys[self.current_key_idx]
-        try:
-            self.client = genai.Client(api_key=current_key)
-        except Exception as e:
-            self.client = None
-            self.log_callback(f"❌ [AI] 설정 오류: {e}")
-    '''
     
     def _configure_ai(self):
         """Cerebras API 클라이언트 설정 (OpenAI 호환)"""
@@ -148,40 +192,6 @@ class SourcingProcessor:
         self.log_callback(f"⚠️ [AI] 모델 변경 -> {new_model}")
         return True
 
-    
-    '''
-    def _call_gemini_with_retry(self, prompt, context=""):
-        """AI 호출 (재시도 및 키 로테이션 포함)"""
-        max_attempts = len(self.api_keys) * len(self.model_candidates)
-        if max_attempts == 0: max_attempts = 1
-        
-        for attempt in range(max_attempts):
-            try:
-                if not self.client: self._configure_genai()
-                if not self.client: raise Exception("Client 없음")
-
-                model_name = self.model_candidates[self.current_model_idx]
-                response = self.client.models.generate_content(
-                    model=model_name, contents=prompt
-                )
-                if response and response.text:
-                    return response.text.replace('```json', '').replace('```', '').strip()
-            
-            except Exception as e:
-                err_msg = str(e).lower()
-                if "429" in err_msg or "quota" in err_msg:
-                    self.log_callback(f"⏳ [AI] 할당량 초과 ({context}). 키 교체 중...")
-                    if not self._rotate_api_key():
-                        self._switch_model()
-                    time.sleep(1)
-                else:
-                    self.log_callback(f"⚠️ [AI] 오류: {e}")
-                    time.sleep(1)
-        
-        self.log_callback(f"❌ [AI] '{context}' 실패 (모든 키 소진)")
-        return None
-    '''    
-
     def _call_ai_with_retry(self, prompt, context=""):
         """
         Cerebras 최적화 호출 로직
@@ -193,8 +203,13 @@ class SourcingProcessor:
         system_msg = "You are a professional e-commerce assistant. Provide direct answers. DO NOT include <think> tags or reasoning."
         if any(x in context for x in ["추출", "분석", "검증"]):
             system_msg += " Always output in valid JSON format ONLY."
+            system_msg += f"### OUTPUT INSTRUCTIONS ###\n"
+            system_msg += f"- Response must be a single, valid JSON object.\n"
+            system_msg += f"- DO NOT include any explanations or markdown outside the JSON block.\n"
+            system_msg += f"- For Japanese or special characters, output them as-is without manual unicode escaping.\n"
+            system_msg += f"- Prevent 'Invalid \\uXXXX escape' by not using raw backslashes unless necessary for valid JSON escaping.\n"
         else:
-            system_msg = "Output ONLY the translated string, no JSON, no brackets."
+            system_msg += " Answer concisely without extra explanations."
 
         max_grand_cycles = 2 # 전체 자원 순회 횟수 (대기 포함)
         
@@ -235,7 +250,6 @@ class SourcingProcessor:
                         # JSON 형태가 아예 없다면 번역 결과 등으로 판단하여 그대로 반환
                         final_res = clean_text
 
-                    self.log_callback(f"🔍 [DEBUG AI Raw] {context} ({current_model}):\n{final_res}")
                     return final_res
 
                 except Exception as e:
@@ -275,98 +289,133 @@ class SourcingProcessor:
     # ============================================================
     # [Logic] 분석 및 데이터 추출 (기존 로직 유지)
     # ============================================================
-    def detect_and_translate(self, url, keyword):
-        """쇼핑몰 URL에 맞춰 키워드 번역"""
-        target_lang = None
-        if any(x in url for x in ['taobao', '1688', 'tmall']): target_lang = "Simplified Chinese"
-        elif any(x in url for x in ['amazon', 'ebay']): target_lang = "English"
-        elif any(x in url for x in ['rakuten']): target_lang = "Japanese"
-        
-        if target_lang:
-            prompt = f"Translate the term '{keyword}' to {target_lang}. Return ONLY the translated string."
-            res = self._call_ai_with_retry(prompt, "번역")
-            if res:
-                cleaned = res.replace('"', '').replace("'", "").strip()
-                self.log_callback(f"   ㄴ 🔤 번역: {keyword} -> {cleaned}")
-                return cleaned
-        return keyword
-
+    
     def extract_full_info(self, title, context_text="", search_keyword=""):
-        """상품 정보 추출 및 검색 의도 적합성 검증"""
+        """[1단계] AI는 오직 상세페이지에서 원어 데이터를 '정확하게' 추출하는 데 집중합니다."""
         prompt = (
-            f"Role: Professional E-commerce Localization Expert\n"
-            f"Search Intent: Finding items related to '{search_keyword}'.\n"
+            f"Role: Data Extraction Specialist (No Translation)\n"
+            f"Search Intent: '{search_keyword}'\n"
             f"Original Title: '{title}'\n"
             f"Context: '{context_text[:1500]}'\n\n"
             
-            f"### CRITICAL RULES ###\n"
-            f"1. **NO USED ITEMS**: If the product is 'Used', 'Pre-owned', 'Refurbished', or contains '중고' / '中古', set 'is_valid' to false.\n"
-            f"2. **REASONING**: If 'is_valid' is false due to being a used item, the 'reason' must be: '중고 상품이므로 적절한 소싱 대상이 아님'.\n"
-            f"3. **TITLE LOCALIZATION**: Translate to natural Korean. Remove all Katakana and Hanja (e.g., 工具 -> 공구). Translate to a natural Korean SEO title. Focus on the specific product name and its key features (e.g., 'Pilot G2 Retractable Gel Pen' -> '파이롯트 G2 노크식 젤펜'). Avoid generic terms like 'Stationery' if a specific name exists.\n"
-            f"4. **CATEGORY CANDIDATES**: Extract 3 specific Korean product type nouns (e.g., ['라쳇', '압착기', '렌치']).\n"
-            f"5. **MANUFACTURER & BRAND**: Keep the original source text as it appears. **DO NOT TRANSLATE**.\n"
+            f"### CRITICAL TASK: EXCEL SEARCH KEYWORDS ###\n"
+            f"1. **core_item**: The most general noun in Korean, not with adverbs or adjectives(e.g., '레일전등').\n"
+            f"2. **alt_item**: A slightly broader synonym or related category name (e.g., '조명' or '전등').\n"
+            f"   - **Goal**: These words must exist in a standard shopping mall category list. So the noun must be a leaf node in the category tree.\n\n"
+            
+            f"Output JSON format:\n"
+            f"{{\n"
+            f"  \"is_valid\": true,\n"
+            f"  \"reason\": \"...\",\n"
+            f"  \"product_title\": \"Original Language Title\",\n"
+            f"  \"core_item\": \"Extracted Core Noun\",\n"
+            f"  \"alt_item\": \"Extracted Alternate Category\",\n"
+            f"  \"original_features\": [\"feat1\", \"feat2\", \"feat3\", \"feat4\", \"feat5\"]\n"
+            f"}}"
+        )
+    
+        res = self._call_ai_with_retry(prompt, "JSON 정보 추출")
+        if res:
+            try:
+                clean_json = res.replace('```json', '').replace('```', '').strip()
+                return json.loads(clean_json)
+            except Exception as e:
+                self.log_callback(f"⚠️ [AI] 원어 추출 JSON 파싱 실패: {e}")
+        return None
+
+    def detect_and_translate(self, url, keyword):
+        """쇼핑몰 URL에 맞춰 키워드 번역"""
+        target_lang = None
+        if any(x in url for x in ['taobao', '1688', 'tmall']): target_lang = "zh-CN"
+        elif any(x in url for x in ['amazon', 'ebay']): target_lang = "en"
+        elif any(x in url for x in ['rakuten']): target_lang = "ja"
+        
+        # 2. 번역 실행
+        if target_lang:
+            try:
+                translated = google_translator.translate(keyword, dest=target_lang, src='ko').text.strip()
+            
+                if translated:
+                    cleaned = translated.strip()
+                    self.log_callback(f"   ㄴ 🔤 번역: {keyword} -> {cleaned}")
+                    return cleaned
+                
+            except Exception as e:
+                self.log_callback(f"   ⚠️ 키워드 번역 실패: {e}")
+            
+        return keyword # 번역 실패하거나 대상 언어가 없으면 원본 키워드 반환
+    
+    def refine_results(self, raw_data):
+        """[2, 3단계] 번역기 데이터를 재료 삼아, AI가 '네이티브 한국어'로 제목을 재창작합니다."""
+        if not raw_data or not raw_data.get('is_valid'):
+            return raw_data
+
+        # --- 기계 번역 (기초 재료 준비) ---
+        base_ko_title = translate_text(raw_data['product_title'])
+        ko_features = translate_keywords_list(raw_data['original_features'])
+        
+        hint = raw_data.get('core_item', "")
+        alt_hint = raw_data.get('alt_item', '')
+
+        cp_candidates = self.excel_handler.get_category_candidates(hint, alt_hint, base_ko_title, 'coupang', limit=10)
+        nv_candidates = self.excel_handler.get_category_candidates(hint, alt_hint, base_ko_title, 'naver', limit=10)
+        
+        self.log_callback(f"   ㄴ 📊 카테고리 후보 (쿠팡): {cp_candidates}")
+        self.log_callback(f"   ㄴ 📊 카테고리 후보 (네이버): {nv_candidates}")
+    
+    
+        # --- AI 한국어 최적화 (SEO 및 문장 다듬기) ---
+        refine_prompt = (
+            f"Role: Senior Korean E-commerce Merchandiser & SEO Copywriter\n"
+            f"Base Material (Raw Translation of the title): '{base_ko_title}'\n"
+            f"Base Material (Features): {', '.join(ko_features)}\n"
+            f"Base Material (Coupang Category Candidates): {', '.join(cp_candidates)}\n"
+            f"Base Material (Naver Category Candidates): {', '.join(nv_candidates)}\n"
+            f"Original Brand: {raw_data.get('brand')}\n\n"
+            
+            f"### CRITICAL TASK 1: NATURAL REWRITING OF THE TITLE ###\n"
+            f"1. **ESCAPE LITERAL TRANSLATION**: The 'Base Material' provided above might be an awkward, literal translation (직역). Your primary mission is to REWRITE it into extremely natural, native-level Korean.\n"
+            f"2. **SHOPPING MALL STYLE**: Format the title to be catchy and trustworthy for Korean customers on Naver or Coupang.\n"
+            f"   - Format: [Brand] + Product Name + Essential Spec + Quantity (Keep it under 45 chars).\n"
+            f"3. **SEO KEYWORDS**: Create 5 trendy keywords based on the 'natural' product name you created.\n"
+
+            f"### CRITICAL TASK 2: SELECTION FOR COUPANG AND NAVER CATEGORY###\n"
+            f"1. **CATEGORY MATCHING**: From the provided category candidates, select the one that best fits the product referring to the base title and features.\n"
+            f"2. **CATEGORY FORMATTING**: Format the category as '[product code] category path>...' exactly as it appears in the candidate list. This is crucial for Excel matching later.\n"
 
             f"Output JSON format:\n"
             f"{{\n"
-            f"  \"is_valid\": true/false,\n"
-            f"  \"reason\": \"...\",\n"
-            f"  \"productTitle\": \"자연스러운 한국어 SEO 상품명\",\n"
-            f"  \"manufacturer\": \"...\",\n"
-            f"  \"brand\": \"...\",\n"
-            f"  \"model\": \"...\",\n"
-            f"  \"keywords\": [\"태그1\", \"태그2\"]\n"
-            f"  \"category_candidates\": [\"후보1\", \"후보2\", \"후보3\"]\n"
-            f"}}"
+            f"  \"refined_title\": \"자연스럽게 재창작된 한국어 상품명\",\n"
+            f"  \"seo_keywords\": [\"키워드1\", \"2\", \"3\", \"4\", \"5\"]\n"
+            f"  \"refined_category_cp\": \"[product code] 쿠팡>카테고리>전체>문자열>그대로>복사\",\n"
+            f"  \"refined_category_nv\": \"[product code] 네이버>카테고리>전체>문자열>그대로>복사\"\n"
+            f"}}\n\n"
+            
         )
-        res = self._call_ai_with_retry(prompt, "정보 추출 및 검증")
-        if res:
+    
+        refine_res = self._call_ai_with_retry(refine_prompt, "한국어 제목 재가공")
+        if refine_res:
             try:
-                # 불필요한 마크다운 코드 블록(```json) 제거 후 로드
-                clean_json = res.replace('```json', '').replace('```', '').strip()
-                data = json.loads(clean_json)
-                return data
-            except Exception as e:
-                self.log_callback(f"⚠️ [AI] JSON 파싱 실패: {e}")
-        return None
-
-
-    def check_trademark(self, brand):
-        """KIPRIS 상표권 조회"""
-        if not brand or brand.upper() in ["NULL", "OEM", "NONE", ""]: return True
-        
-        brand = brand.strip().upper()
-        if brand in self.brand_cache: return self.brand_cache[brand]
-        if not self.kipris_keys: return True
-
-        api_url = "https://plus.kipris.or.kr/kipo-api/kipi/trademarkInfoSearchService/getWordSearch"
-        
-        for _ in range(len(self.kipris_keys)):
-            current_key = self.kipris_keys[self.current_kipris_idx]
-            try:
-                res = requests.get(api_url, params={'searchString': brand, 'ServiceKey': current_key}, timeout=5)
-                if res.status_code != 200: raise Exception("Status Error")
+                clean_json = refine_res.replace('```json', '').replace('```', '').strip()
+                refined_data = json.loads(clean_json)
                 
-                root = ET.fromstring(res.content)
-                count_tag = root.find(".//totalCount")
-                if count_tag is None: raise Exception("XML Parse Error")
+                raw_data['translated_title'] = refined_data['refined_title']
+                raw_data['seo_keywords'] = refined_data['seo_keywords']
+                raw_data['category_cp'] = refined_data['refined_category_cp']
+                raw_data['category_nv'] = refined_data['refined_category_nv']
                 
-                count = int(count_tag.text)
-                is_safe = (count == 0)
-                
-                if not is_safe:
-                    self.log_callback(f"   🚫 [KIPRIS] 상표권 발견: '{brand}' ({count}건)")
-                    self._save_cache()
-                
-                self.brand_cache[brand] = is_safe
-                return is_safe
+                self.log_callback(f"   ㄴ ✨ SEO 최적화 완료 (제목): {raw_data['translated_title']}")
+                self.log_callback(f"   ㄴ ✨ SEO 최적화 완료 (키워드): {raw_data['seo_keywords']}")
+                self.log_callback(f"   ㄴ ✨ SEO 최적화 완료 (쿠팡 카테고리): {raw_data['category_cp']}")
+                self.log_callback(f"   ㄴ ✨ SEO 최적화 완료 (네이버 카테고리): {raw_data['category_nv']}")
 
+                return raw_data
             except:
-                # 키 교체 후 재시도
-                self.current_kipris_idx = (self.current_kipris_idx + 1) % len(self.kipris_keys)
-        
-        return True # 조회 실패 시 통과 처리
+                self.log_callback(f"⚠️ [AI] 한국어 최적화 JSON 파싱 실패, 원문 데이터로 저장: {refined_data[:100]}...")
+                return raw_data
+                
+        return raw_data
 
-    # ============================================================
     # [Callback] 상세 페이지 처리 핵심 로직 (자동/반자동 공용)
     # ============================================================
     def _process_product_callback(self, driver, raw_title):
@@ -392,29 +441,25 @@ class SourcingProcessor:
                 self.log_callback("   🗑️ [Skip] 유효하지 않은 상품")
                 return False
 
-            final_title = info.get('productTitle', raw_title)
-            brand = info.get('brand', '')
+            refined_info = self.refine_results(info)
+
+            final_title = refined_info.get('translated_title', raw_title)
+            brand = refined_info.get('brand', '')
 
             # 3. KIPRIS 상표권 검사
             if not self.check_trademark(brand):
                 return False # 상표권 이슈로 중단
-            
-            cat_hint = info.get('category_candidates', [])
-
-            # 4. 카테고리 분석 및 매칭
-            cp_cat = self.excel_handler.find_best_category(cat_hint, 'coupang')
-            nv_cat = self.excel_handler.find_best_category(cat_hint, 'naver')
 
             # 5. 엑셀 저장
             data_row = {
-                'title': final_title,
+                'translated_title': final_title,
                 'url': driver.current_url,
-                'tags': info.get('keywords', []),
-                'cp_cat': cp_cat,
-                'nv_cat': nv_cat,
-                'manufacturer': info.get('manufacturer', 'OEM'),
+                'tags': refined_info.get('seo_keywords', []),
+                'cp_cat': refined_info.get('category_cp', ''),
+                'nv_cat': refined_info.get('category_nv', ''),
+                'manufacturer': refined_info.get('manufacturer', 'OEM'),
                 'brand': brand,
-                'model': info.get('model', '')
+                'model': refined_info.get('model', '')
             }
             
             if self.excel_handler.save_product(data_row):
@@ -513,7 +558,6 @@ class SourcingProcessor:
         return f"{base_url}/search?q={keyword}"
     
     def run_auto_mode(self, shop_url, keywords, max_count):
-        from urllib.parse import urljoin  # 상대 경로 결합을 위해 필요
         
         for kw in keywords:
             translated_kw = self.detect_and_translate(shop_url, kw)
@@ -531,7 +575,9 @@ class SourcingProcessor:
                 self.log_callback(f"\n📑 [Page {page}] '{translated_kw}' 분석 중... (진행: {total_saved_count}/{max_count})")
                 self.log_callback(f"🌐 [Step 1] URL 접속 시도 중...")
                 self.browser.driver.get(search_url)
-                time.sleep(3)
+                for i in range(3):
+                    self.browser.driver.execute_script(f"window.scrollTo(0, {(i+1)*800});")
+                    time.sleep(1.5)
 
                 is_amazon = "amazon" in shop_url.lower()
                 is_rakuten = "rakuten" in shop_url.lower()
@@ -560,6 +606,28 @@ class SourcingProcessor:
                 for idx, item in enumerate(items):
                     if (idx + 1) % 20 == 0:
                         self.log_callback(f"   ⏳ [{idx+1}/{len(items)}] 항목 필터링 중...")
+                        
+                    # -----------------------------------------------------------
+                    # [디버깅 추가] 10개마다 샘플 출력 (최대 15개)
+                    # -----------------------------------------------------------
+                    if idx % 10 == 0:
+                        try:
+                            # 일단 아무 <a> 태그나 가져와서 원본 확인
+                            raw_el = item.find_element(By.TAG_NAME, "a")
+                            raw_href = raw_el.get_attribute("href")
+                            raw_title = raw_el.get_attribute("title") or raw_el.text.strip()
+                            
+                            self.log_callback(f"🔍 [Sample] 원본 제목: {raw_title[:20]}...")
+                            self.log_callback(f"   🔗 원본 링크: {raw_href[:50]}...")
+                            
+                            # 아마존이라면 ASIN 존재 여부도 확인
+                            if is_amazon:
+                                raw_asin = item.get_attribute("data-asin")
+                                self.log_callback(f"   🆔 ASIN 존재 여부: {'O' if raw_asin else 'X'}")
+                            
+                        except:
+                            pass
+                    # -----------------------------------------------------------
                     
                     try:
                         # [1] 링크 및 제목 추출
@@ -572,7 +640,14 @@ class SourcingProcessor:
                                 except: link_el = item.find_element(By.TAG_NAME, "a")
 
                         link = link_el.get_attribute("href")
-                        title = link_el.get_attribute("title") or link_el.text.strip()
+                        title = link_el.get_attribute("aria-label") or link_el.get_attribute("title") or link_el.text.strip()
+                        
+                        if not title:
+                            try:
+                                img_el = item.find_element(By.TAG_NAME, "img")
+                                title = img_el.get_attribute("alt").strip()
+                            except:
+                                pass
 
                         # [2] 경로 정규화 및 유효성 검사
                         if link and link.startswith("/"):
@@ -580,21 +655,16 @@ class SourcingProcessor:
                         
                         if not isinstance(link, str) or not link.startswith("http"):
                             continue
-
-                        # [3] 쓰레기 링크 및 중고 필터링
-                        if not title or len(title) < 3: continue
                         
-                        garbage_list = ['help', 'customer', 'contact', 'policy', 'terms', 'sponsored', 'previous', 'next', 'javascript:', 'faq']
-                        if any(g in link.lower() or g in title.lower() for g in garbage_list):
-                            continue
-
                         if any(x in title for x in ['중고', '中古', 'Used', 'Pre-owned', 'Refurbished']):
+                            self.log_callback(f"   🗑️ [Skip] 중고 상품 필터링: {title[:30]}...")
                             continue
 
-                        # [4] 아마존 전용 ASIN 검증
                         if is_amazon:
                             asin = item.get_attribute("data-asin")
-                            if not asin or len(asin) < 5: continue
+                            if not asin: 
+                                self.log_callback(f"   🗑️ [Skip] 아마존 상품 필터링: {title[:30]}...")
+                                continue
 
                         # [5] 가격 추출 및 필터링
                         krw_price = 0
@@ -611,12 +681,15 @@ class SourcingProcessor:
                                 krw_price = float(clean_price_str) * self.current_rate
                         except:
                             pass # 가격 못 찾아도 일단 통과 (상세페이지에서 재확인)
+                        
+                        self.log_callback(f"   💰 가격 추출: {krw_price:.0f}원 (원본: '{raw_price_text if 'raw_price_text' in locals() else 'N/A'}')")
 
                         p_min = float(self.config.get('PRICE_MIN', 0))
                         p_max = float(self.config.get('PRICE_MAX', 0))
 
                         if krw_price > 0:
                             if (p_min > 0 and krw_price < p_min) or (p_max > 0 and krw_price > p_max):
+                                self.log_callback(f"   🗑️ [Skip] 가격 필터링: {krw_price:.0f}원 ({title[:30]}...)")
                                 continue
 
                         # 최종 통과된 상품만 추가

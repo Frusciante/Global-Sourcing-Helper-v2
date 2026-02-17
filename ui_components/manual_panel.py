@@ -1,14 +1,7 @@
 import customtkinter as ctk
 import threading
-import json
 import re
-import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
-from logic.utils import fetch_naver_exchange_rate
+from logic.utils import fetch_naver_exchange_rate, fetch_naver_trend_keywords
 
 class ManualControlPanel(ctk.CTkToplevel):
     def __init__(self, master, on_collect, on_stop):
@@ -114,38 +107,47 @@ class ManualControlPanel(ctk.CTkToplevel):
         for w in self.scroll.winfo_children(): w.destroy()
         ctk.CTkLabel(self.scroll, text="로딩 중...").pack()
         self.btn_ref.configure(state="disabled")
-        cat = self.naver_map.get(self.combo.get(), "ALL")
-        threading.Thread(target=self._fetch, args=(cat,), daemon=True).start()
+        cat_name = self.combo.get()
+        cat_code = self.naver_map.get(cat_name, "50000008")
+        
+        # Selenium 드라이버 없이 requests 함수 호출
+        threading.Thread(target=self._fetch_trend, args=(cat_code,), daemon=True).start()
 
-    def _fetch(self, cat_code):
-        driver = None
+    def _fetch_trend(self, cat_code):
         try:
-            url = f"https://search.shopping.naver.com/best/category/click?period=P1D"
-            if cat_code != "ALL": url += f"&categoryCategoryId={cat_code}&categoryRootCategoryId={cat_code}"
-            opts = Options()
-            opts.add_argument("--headless=new")
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-            driver.get(url)
-            driver.implicitly_wait(3)
-            raw = driver.find_element(By.ID, "__NEXT_DATA__").get_attribute("innerHTML")
-            data = json.loads(raw)
-            prods = []
-            for q in data['props']['pageProps']['dehydratedState']['queries']:
-                if 'data' in q['state'] and 'products' in q['state']['data']:
-                    prods = q['state']['data']['products']; break
-            items = [p['productName'] for p in prods[:20] if p.get('productName')]
-            self.after(0, lambda: self._update(True, items))
+            # utils.py에 추가한 함수 호출
+            keywords = fetch_naver_trend_keywords(cat_code)
+            
+            if keywords:
+                self.after(0, lambda: self._update_ui(True, keywords))
+            else:
+                self.after(0, lambda: self._update_ui(False, "데이터를 불러오지 못했습니다."))
         except Exception as e:
-            self.after(0, lambda: self._update(False, str(e)))
-        finally:
-            if driver: driver.quit()
+            self.after(0, lambda: self._update_ui(False, str(e)))
 
-    def _update(self, success, items):
+    def _update_ui(self, success, items):
+        """메인 스레드에서 UI 업데이트"""
         self.btn_ref.configure(state="normal")
         for w in self.scroll.winfo_children(): w.destroy()
+        
         if not success:
-            ctk.CTkLabel(self.scroll, text=f"오류: {items}", text_color="red").pack()
+            ctk.CTkLabel(self.scroll, text=f"⚠️ {items}", text_color="red").pack(pady=10)
             return
+            
         for idx, item in enumerate(items):
-            ctk.CTkButton(self.scroll, text=f"{idx+1}. {item}", anchor="w", fg_color="transparent", 
-                          command=lambda t=item: [self.clipboard_clear(), self.clipboard_append(t)]).pack(fill="x")
+            # 클릭 시 클립보드에 키워드가 복사되는 버튼 생성
+            btn = ctk.CTkButton(
+                self.scroll, 
+                text=f"{idx+1:02d}. {item}", 
+                anchor="w", 
+                fg_color="transparent", 
+                hover_color="#3b8ed0",
+                command=lambda t=item: self._copy_to_clipboard(t)
+            )
+            btn.pack(fill="x", padx=5, pady=2)
+
+    def _copy_to_clipboard(self, text):
+        """키워드 복사 기능"""
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        # 선택 사항: 복사 완료 알림 처리 등
